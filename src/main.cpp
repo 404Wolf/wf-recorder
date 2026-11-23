@@ -1016,6 +1016,87 @@ Examples:)");
     exit(EXIT_SUCCESS);
 }
 
+/* Whether the compositor sends screencopy frames already upright, in the
+ * output's transform, rather than in the output's buffer orientation.
+ * wlroots sends the buffer orientation, so a rotated output needs the
+ * transpose that init_video_filters() adds; Hyprland (since 0.52, "always
+ * render in normal transform") sends them upright, and transposing again
+ * turns the video a quarter turn. The protocol has no transform event, so
+ * ask: the size of a whole-output frame on an output turned by 90 or 270
+ * degrees shows which orientation it comes in. Returns false when no output
+ * can tell (none is turned a quarter turn, or they are square): the old
+ * behaviour. */
+struct frame_size_probe
+{
+    uint32_t width = 0, height = 0;
+    bool done = false;
+};
+
+static void probe_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *,
+    uint32_t, uint32_t width, uint32_t height, uint32_t)
+{
+    auto probe = (frame_size_probe*) data;
+    probe->width = width;
+    probe->height = height;
+    probe->done = true;
+}
+
+static void probe_handle_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *,
+    uint32_t, uint32_t width, uint32_t height)
+{
+    auto probe = (frame_size_probe*) data;
+    if (!probe->width) {
+        probe->width = width;
+        probe->height = height;
+    }
+}
+
+static void probe_handle_done(void *data, struct zwlr_screencopy_frame_v1 *)
+{
+    ((frame_size_probe*) data)->done = true;
+}
+
+static void probe_handle_ignore_flags(void *, struct zwlr_screencopy_frame_v1 *, uint32_t) {}
+static void probe_handle_ignore_ready(void *, struct zwlr_screencopy_frame_v1 *,
+    uint32_t, uint32_t, uint32_t) {}
+static void probe_handle_ignore_damage(void *, struct zwlr_screencopy_frame_v1 *,
+    uint32_t, uint32_t, uint32_t, uint32_t) {}
+
+static const struct zwlr_screencopy_frame_v1_listener probe_listener = {
+    .buffer = probe_handle_buffer,
+    .flags = probe_handle_ignore_flags,
+    .ready = probe_handle_ignore_ready,
+    .failed = probe_handle_done,
+    .damage = probe_handle_ignore_damage,
+    .linux_dmabuf = probe_handle_linux_dmabuf,
+    .buffer_done = probe_handle_done,
+};
+
+static bool compositor_sends_upright_frames()
+{
+    for (auto& wo : available_outputs)
+    {
+        if (!(wo.transform & 1) || wo.width == wo.height)
+            continue;
+
+        frame_size_probe probe;
+        auto probe_frame = zwlr_screencopy_manager_v1_capture_output(
+            screencopy_manager, 0, wo.output);
+        zwlr_screencopy_frame_v1_add_listener(probe_frame, &probe_listener, &probe);
+        while (!probe.done && wl_display_roundtrip(display) != -1) {
+            // Wait for the frame's buffer size.
+        }
+        zwlr_screencopy_frame_v1_destroy(probe_frame);
+
+        if (!probe.width || probe.width == probe.height)
+            continue;
+        /* wo.width x wo.height is the logical, already turned, size. */
+        return (probe.width > probe.height) == (wo.width > wo.height);
+    }
+
+    return false;
+}
+
 capture_region selected_region{};
 wf_recorder_output *chosen_output = nullptr;
 zwlr_screencopy_frame_v1 *frame = NULL;
@@ -1357,6 +1438,11 @@ int main(int argc, char *argv[])
     }
 
     params.transform = chosen_output->transform;
+    if (params.transform != WL_OUTPUT_TRANSFORM_NORMAL && compositor_sends_upright_frames())
+    {
+        fprintf(stderr, "The compositor sends frames already upright: not transforming them\n");
+        params.transform = WL_OUTPUT_TRANSFORM_NORMAL;
+    }
 
     if (selected_region.is_selected())
     {
